@@ -1,0 +1,607 @@
+"""
+Parallel Hill Climber (10 islands) on seasonal L-system trees
+
+The following code runs parallel hill climber on 10 different islands of fractal trees
+
+The 
+"""
+
+import math
+import random
+import turtle
+import multiprocessing as mp
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+# ============================================================
+# WORLD / GRID
+# ============================================================
+
+WORLD_W = 800
+WORLD_H = 800
+
+BIN = 3
+NX = WORLD_W // BIN
+NY = WORLD_H // BIN
+
+GROUND_Y = -WORLD_H / 2 + 40  # ground line and start y
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def world_to_cell(x, y):
+    gx = int((x + WORLD_W / 2) / BIN)
+    gy = int((y + WORLD_H / 2) / BIN)
+    if 0 <= gx < NX and 0 <= gy < NY:
+        return gx, gy
+    return None
+
+# ============================================================
+# GENOTYPE (separate trunk and branch rewrite weights)
+# ============================================================
+
+AXIOM = "T"
+
+TRUNK_CHOICES = [
+    "TF",                  # extend trunk
+    "TF[+B]F",             # extend + one branch
+    "TF[-B]F",             # extend + one branch other side
+    "TF[+B]F[-B]F",        # extend + two branches
+    "TF[+B][-B]F",         # two branches from same node
+]
+
+BRANCH_CHOICES = [
+    "BF",                  # extend branch
+    "BFF",                 # faster branch extension
+    "BF[+B]F",             # branch + sub-branch
+    "BF[-B]F",             # branch + sub-branch other side
+    "BF[+B]F[-B]F",        # branch + two sub-branches
+]
+
+@dataclass(frozen=True)
+class Genome:
+    angle: float
+    step: float
+    wT: Tuple[float, ...]  # trunk rule weights
+    wB: Tuple[float, ...]  # branch rule weights
+
+def normalize_weights(ws: List[float]) -> Tuple[float, ...]:
+    s = sum(max(0.0, x) for x in ws)
+    if s <= 1e-12:
+        return tuple([1.0 / len(ws)] * len(ws))
+    return tuple(max(0.0, x) / s for x in ws)
+
+def sample_choice(rng: random.Random, weights: Tuple[float, ...], choices: List[str]) -> str:
+    r = rng.random()
+    acc = 0.0
+    for w, rule in zip(weights, choices):
+        acc += w
+        if r <= acc:
+            return rule
+    return choices[-1]
+
+def random_genome(rng: random.Random) -> Genome:
+    angle = rng.uniform(12.0, 40.0)
+    step = rng.uniform(3.0, 8.0)
+    wT = normalize_weights([rng.random() for _ in TRUNK_CHOICES])
+    wB = normalize_weights([rng.random() for _ in BRANCH_CHOICES])
+    return Genome(angle=angle, step=step, wT=wT, wB=wB)
+
+def mutate(genome: Genome, rng: random.Random,
+           sigma_angle=1.8, sigma_step=0.35, sigma_w=0.12) -> Genome:
+    angle = clamp(genome.angle + rng.gauss(0, sigma_angle), 6.0, 55.0)
+    step  = clamp(genome.step  + rng.gauss(0, sigma_step),  2.0, 10.0)
+
+    wT = list(genome.wT)
+    wB = list(genome.wB)
+    for i in range(len(wT)):
+        wT[i] = max(0.0, wT[i] + rng.gauss(0, sigma_w))
+    for i in range(len(wB)):
+        wB[i] = max(0.0, wB[i] + rng.gauss(0, sigma_w))
+
+    return Genome(angle=angle, step=step, wT=normalize_weights(wT), wB=normalize_weights(wB))
+
+# ============================================================
+# L-SYSTEM EXPANSION (seasonal)
+# ============================================================
+
+def expand_one_iteration(s: str, genome: Genome, rng: random.Random) -> str:
+    out = []
+    for c in s:
+        if c == "T":
+            out.append(sample_choice(rng, genome.wT, TRUNK_CHOICES))
+        elif c == "B":
+            out.append(sample_choice(rng, genome.wB, BRANCH_CHOICES))
+        else:
+            out.append(c)  # F + - [ ] pass through
+    return "".join(out)
+
+# ============================================================
+# LIGHT / SHADE (uniform skylight; shade from leaves only)
+# ============================================================
+
+SHADE_ABSORB = 2.2
+
+def shade_above(shade: List[List[float]], x, y) -> float:
+    cell = world_to_cell(x, y)
+    if cell is None:
+        return 0.0
+    gx, gy = cell
+    if gy + 1 >= NY:
+        return 0.0
+    col = shade[gx]
+    return sum(col[gy+1:])
+
+def light_here(shade: List[List[float]], x, y) -> float:
+    base = 1.0
+    s = shade_above(shade, x, y)
+    return base * (1.0 / (1.0 + SHADE_ABSORB * s))
+
+def build_shade_from_leaves(leaves_xy: List[Tuple[float, float]], leaf_shade_strength: float) -> List[List[float]]:
+    shade = [[0.0 for _ in range(NY)] for _ in range(NX)]
+    for (x, y) in leaves_xy:
+        cell = world_to_cell(x, y)
+        if cell is None:
+            continue
+        gx, gy = cell
+        shade[gx][gy] += leaf_shade_strength
+    return shade
+
+# ============================================================
+# PHENOTYPE STATE + GROWTH
+# ============================================================
+
+@dataclass
+class SimState:
+    x: float
+    y: float
+    heading_deg: float
+    path_len: float
+    stack: List[Tuple[float, float, float, float]]  # (x, y, heading, path_len)
+
+    commands: str
+    idx: int
+
+    segments: int
+    seg_mids: List[Tuple[float, float]]
+    leaves: List[Tuple[float, float, float]]  # (x, y, path_len)
+
+def init_state() -> SimState:
+    return SimState(
+        x=0.0,
+        y=GROUND_Y,
+        heading_deg=90.0,
+        path_len=0.0,
+        stack=[],
+        commands=AXIOM,
+        idx=0,
+        segments=0,
+        seg_mids=[],
+        leaves=[],
+    )
+
+def forward_step(x, y, heading_deg, step) -> Tuple[float, float]:
+    rad = math.radians(heading_deg)
+    return (x + math.cos(rad) * step, y + math.sin(rad) * step)
+
+def grow_for_budget(
+    state: SimState,
+    budget: float,
+    genome: Genome,
+    costs: Dict[str, float],
+) -> Tuple[float, int]:
+    """
+    Interpret commands forward from state.idx, spending budget.
+    IMPORTANT: Leaves are NOT placed here anymore.
+    """
+    grown = 0
+    step = genome.step
+    angle = genome.angle
+
+    while state.idx < len(state.commands):
+        cmd = state.commands[state.idx]
+
+        if cmd in ("F", "T", "B"):
+            if budget < costs["seg"]:
+                break
+
+            x0, y0 = state.x, state.y
+            x1, y1 = forward_step(x0, y0, state.heading_deg, step)
+
+            # hard ground constraint
+            if y1 < GROUND_Y:
+                break
+
+            budget -= costs["seg"]
+
+            state.seg_mids.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5))
+            state.x, state.y = x1, y1
+            state.segments += 1
+            grown += 1
+            state.path_len += step
+
+        elif cmd == "+":
+            state.heading_deg -= angle
+        elif cmd == "-":
+            state.heading_deg += angle
+
+        elif cmd == "[":
+            if budget < costs["branch"]:
+                break
+            budget -= costs["branch"]
+            state.stack.append((state.x, state.y, state.heading_deg, state.path_len))
+
+        elif cmd == "]":
+            if state.stack:
+                state.x, state.y, state.heading_deg, state.path_len = state.stack.pop()
+
+        state.idx += 1
+
+    return budget, grown
+
+# ============================================================
+# LEAF COMPUTATION (terminal tips by geometry)
+# ============================================================
+
+def compute_terminal_leaves(commands_prefix: str, genome: Genome) -> List[Tuple[float, float, float]]:
+    """
+    Walk the grown prefix and return terminal tips as (x, y, path_len).
+
+    Tip = endpoint of a drawn segment that is never used as a startpoint later.
+    Quantize positions so float noise doesn't break equality checks.
+    """
+    x, y, h = 0.0, GROUND_Y, 90.0
+    path_len = 0.0
+    step = genome.step
+    angle = genome.angle
+
+    stack: List[Tuple[float, float, float, float]] = []
+
+    # startpoints and endpoints (keyed)
+    starts = set()
+    ends: Dict[Tuple[int, int], Tuple[float, float, float]] = {}
+
+    def key(px: float, py: float) -> Tuple[int, int]:
+        # quantize to 0.1 px (good enough to match forward_step deterministically)
+        return (int(round(px * 10)), int(round(py * 10)))
+
+    for cmd in commands_prefix:
+        if cmd in ("F", "T", "B"):
+            x0, y0 = x, y
+            x1, y1 = forward_step(x0, y0, h, step)
+
+            # respect hard ground (if below ground, treat as "no segment")
+            if y1 < GROUND_Y:
+                continue
+
+            starts.add(key(x0, y0))
+            pl2 = path_len + step
+            ends[key(x1, y1)] = (x1, y1, pl2)
+
+            x, y = x1, y1
+            path_len = pl2
+
+        elif cmd == "+":
+            h -= angle
+        elif cmd == "-":
+            h += angle
+
+        elif cmd == "[":
+            stack.append((x, y, h, path_len))
+
+        elif cmd == "]":
+            if stack:
+                x, y, h, path_len = stack.pop()
+
+    leaves: List[Tuple[float, float, float]] = []
+    for k, (ex, ey, pl) in ends.items():
+        if k not in starts:
+            leaves.append((ex, ey, pl))
+    return leaves
+
+# ============================================================
+# FITNESS TERMS
+# ============================================================
+
+def transport_cost(leaves: List[Tuple[float, float, float]], transport_k: float) -> float:
+    return transport_k * sum(pl for (_, _, pl) in leaves)
+
+def support_cost(seg_mids: List[Tuple[float, float]], support_k: float) -> float:
+    # torque-ish leverage proxy: x^2 weighted by height above ground
+    total = 0.0
+    for x, y in seg_mids:
+        h = max(0.0, y - GROUND_Y)
+        total += (x * x) * (1.0 + 0.003 * h)
+    return support_k * total
+
+def cantilever_leaf_cost(leaves: List[Tuple[float, float, float]], cantilever_k: float) -> float:
+    return cantilever_k * sum((x * x) * pl for (x, _, pl) in leaves)
+
+def crowding_cost(seg_mids: List[Tuple[float, float]], crowd_k: float) -> float:
+    occ = {}
+    for (x, y) in seg_mids:
+        cell = world_to_cell(x, y)
+        if cell is None:
+            continue
+        occ[cell] = occ.get(cell, 0) + 1
+    return crowd_k * sum((n - 1) ** 2 for n in occ.values() if n > 1)
+
+# ============================================================
+# EVALUATION (season simulation)
+# ============================================================
+
+@dataclass
+class EvalResult:
+    fitness: float
+    seasons_run: int
+    final_state: SimState
+
+def evaluate_genome(
+    genome: Genome,
+    eval_seed: int,
+    seasons: int = 28,
+    max_commands: int = 180_000,
+
+    # resources
+    R0_range: Tuple[float, float] = (600.0, 1400.0),
+    Rcap: float = 2500.0,
+    leaf_eff: float = 3.0,
+    leaf_shade_strength: float = 0.55,
+
+    # action costs
+    costs: Optional[Dict[str, float]] = None,
+
+    # maintenance
+    maint_seg: float = 0.02,
+    maint_leaf: float = 0.05,
+
+    # penalties
+    transport_k: float = 0.002,
+    support_k: float = 0.00005,
+    cantilever_k: float = 0.000002,
+    crowd_k: float = 0.02,
+) -> EvalResult:
+    if costs is None:
+        costs = {"seg": 1.0, "branch": 2.5}
+
+    rng = random.Random(eval_seed)
+    R = rng.uniform(*R0_range)
+
+    expand_rng = random.Random(hash((eval_seed, genome.angle, genome.step, genome.wT, genome.wB)) & 0xFFFFFFFF)
+
+    state = init_state()
+    total_gain = 0.0
+    total_penalty = 0.0
+    no_growth_streak = 0
+
+    for t in range(seasons):
+        # expand one iteration per season
+        if len(state.commands) < max_commands:
+            state.commands = expand_one_iteration(state.commands, genome, expand_rng)
+
+        # growth: spend resource
+        R, grown = grow_for_budget(state, R, genome, costs)
+        no_growth_streak = (no_growth_streak + 1) if grown == 0 else 0
+
+        # recompute terminal leaves from ACTUAL grown prefix
+        state.leaves = compute_terminal_leaves(state.commands[:state.idx], genome)
+
+        # shade from leaves only
+        shade = build_shade_from_leaves([(x, y) for (x, y, _) in state.leaves], leaf_shade_strength)
+
+        # harvest from leaves
+        gain = 0.0
+        for (x, y, _) in state.leaves:
+            gain += light_here(shade, x, y)
+        gain *= leaf_eff
+
+        # maintenance + storage cap
+        maintenance = maint_seg * state.segments + maint_leaf * len(state.leaves)
+        R = clamp(R - maintenance + gain, 0.0, Rcap)
+
+        total_gain += gain
+        total_penalty += transport_cost(state.leaves, transport_k)
+        total_penalty += support_cost(state.seg_mids, support_k)
+        total_penalty += cantilever_leaf_cost(state.leaves, cantilever_k)
+        total_penalty += crowding_cost(state.seg_mids, crowd_k)
+
+        if no_growth_streak >= 3 and R < costs["seg"]:
+            return EvalResult(fitness=total_gain - total_penalty, seasons_run=t + 1, final_state=state)
+
+    return EvalResult(fitness=total_gain - total_penalty, seasons_run=seasons, final_state=state)
+
+# ============================================================
+# PARALLEL HILL CLIMBER
+# ============================================================
+
+@dataclass
+class HillClimbTrack:
+    initial_genome: Genome
+    final_genome: Genome
+    initial_fit: float
+    final_fit: float
+    history: List[float]
+
+def parallel_hill_climb(
+    n_islands: int = 10,
+    generations: int = 50,
+    base_seed: int = 2026,
+) -> List[HillClimbTrack]:
+    rng = random.Random(base_seed)
+
+    parents: List[Genome] = [random_genome(rng) for _ in range(n_islands)]
+    histories: List[List[float]] = [[] for _ in range(n_islands)]
+
+    compare_seed0 = base_seed * 10_000 + 0
+    initial_fits = [evaluate_genome(parents[i], eval_seed=compare_seed0).fitness for i in range(n_islands)]
+    for i in range(n_islands):
+        histories[i].append(initial_fits[i])
+
+    initial_genomes = parents[:]
+    parent_fits = initial_fits[:]
+
+    for g in range(1, generations + 1):
+        compare_seed = base_seed * 10_000 + g * 97
+
+        for i in range(n_islands):
+            mut_rng = random.Random((base_seed, g, i).__hash__() & 0xFFFFFFFF)
+            child = mutate(parents[i], mut_rng)
+
+            child_fit = evaluate_genome(child, eval_seed=compare_seed).fitness
+            parent_fit = evaluate_genome(parents[i], eval_seed=compare_seed).fitness
+
+            if child_fit >= parent_fit:
+                parents[i] = child
+                parent_fits[i] = child_fit
+            else:
+                parent_fits[i] = parent_fit
+
+            histories[i].append(parent_fits[i])
+
+    tracks: List[HillClimbTrack] = []
+    for i in range(n_islands):
+        tracks.append(HillClimbTrack(
+            initial_genome=initial_genomes[i],
+            final_genome=parents[i],
+            initial_fit=initial_fits[i],
+            final_fit=parent_fits[i],
+            history=histories[i],
+        ))
+    return tracks
+
+# ============================================================
+# MULTIPROCESS RENDERING (macOS-stable)
+# ============================================================
+
+def render_island_process(island_idx: int, init_genome: Genome, final_genome: Genome, render_seed: int):
+    init_eval = evaluate_genome(init_genome, eval_seed=render_seed)
+    fin_eval  = evaluate_genome(final_genome, eval_seed=render_seed)
+
+    screen = turtle.Screen()
+    screen.setup(1100, 700)
+    screen.title(f"Island {island_idx} — Initial vs Final")
+    turtle.colormode(1.0)
+    turtle.tracer(False)
+
+    pen = turtle.Turtle(visible=False)
+    pen.speed(0)
+
+    leaf_shade_strength = 0.55
+    scale = 0.58
+    origin_y = -120
+    left_origin_x = -300
+    right_origin_x = 300
+
+    pen.penup()
+    pen.goto(-520, 300)
+    pen.pencolor(0, 0, 0)
+    pen.write(
+        f"Island {island_idx}   initial_fit={init_eval.fitness:.2f}   final_fit={fin_eval.fitness:.2f}",
+        font=("Arial", 16, "bold"),
+    )
+
+    pen.penup()
+    pen.goto(0, -320)
+    pen.pendown()
+    pen.pencolor(0.25, 0.25, 0.25)
+    pen.goto(0, 320)
+
+    gy = origin_y + GROUND_Y * scale
+    pen.penup()
+    pen.goto(-540, gy)
+    pen.pendown()
+    pen.goto(540, gy)
+
+    def draw_tree(state: SimState, genome: Genome, origin_x: float, label: str):
+        shade = build_shade_from_leaves([(x, y) for (x, y, _) in state.leaves], leaf_shade_strength)
+
+        pen.penup()
+        pen.goto(origin_x - 220, 250)
+        pen.pencolor(0, 0, 0)
+        pen.write(label, font=("Arial", 14, "bold"))
+
+        stack = []
+        x, y, h = 0.0, GROUND_Y, 90.0
+        step = genome.step
+        angle = genome.angle
+
+        pen.penup()
+        pen.goto(origin_x + x * scale, origin_y + y * scale)
+        pen.setheading(h)
+        pen.pendown()
+
+        for cmd in state.commands[:state.idx]:
+            if cmd in ("F", "T", "B"):
+                l = light_here(shade, x, y)
+                pen.pencolor(0.0, clamp(l, 0.0, 1.0), 0.0)
+
+                x2, y2 = forward_step(x, y, h, step)
+                if y2 < GROUND_Y:
+                    continue
+                pen.goto(origin_x + x2 * scale, origin_y + y2 * scale)
+                x, y = x2, y2
+
+            elif cmd == "+":
+                h -= angle
+                pen.setheading(h)
+            elif cmd == "-":
+                h += angle
+                pen.setheading(h)
+            elif cmd == "[":
+                stack.append((x, y, h, pen.position(), pen.heading()))
+            elif cmd == "]":
+                if stack:
+                    x, y, h, pos, th = stack.pop()
+                    pen.penup()
+                    pen.goto(pos)
+                    pen.setheading(th)
+                    pen.pendown()
+
+        pen.penup()
+        for (lx, ly, _) in state.leaves:
+            l = light_here(shade, lx, ly)
+            pen.goto(origin_x + lx * scale, origin_y + ly * scale)
+            pen.dot(5, (0.0, clamp(0.3 + 0.7 * l, 0.0, 1.0), 0.0))
+
+    draw_tree(init_eval.final_state, init_genome, left_origin_x, "INITIAL")
+    draw_tree(fin_eval.final_state, final_genome, right_origin_x, "FINAL")
+
+    turtle.tracer(True)
+    turtle.update()
+    turtle.done()
+
+def show_islands_in_separate_windows(tracks: List[HillClimbTrack], render_seed: int = 999_123):
+    ctx = mp.get_context("spawn")
+    procs = []
+    for i, tr in enumerate(tracks):
+        p = ctx.Process(
+            target=render_island_process,
+            args=(i, tr.initial_genome, tr.final_genome, render_seed),
+        )
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join()
+
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    tracks = parallel_hill_climb(n_islands=10, generations=5, base_seed=2026)
+
+    print("Parallel Hill Climber results (10 islands):")
+    for i, tr in enumerate(tracks):
+        print(
+            f"#{i:02d} initial_fit={tr.initial_fit:8.2f} final_fit={tr.final_fit:8.2f} | "
+            f"angle {tr.initial_genome.angle:5.1f}->{tr.final_genome.angle:5.1f} | "
+            f"step {tr.initial_genome.step:4.1f}->{tr.final_genome.step:4.1f}"
+        )
+
+    show_islands_in_separate_windows(tracks, render_seed=999_123)
+
+if __name__ == "__main__":
+    main()

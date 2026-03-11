@@ -3,7 +3,9 @@ Parallel Hill Climber (10 islands) on seasonal L-system trees
 
 The following code runs parallel hill climber on 10 different islands of fractal trees
 
-The 
+The initial tree and final tree after a specificied number of generations are then illustrated in turtle for each island. 
+
+The number of generations, number of islands, and the initial base seed probability code can all be manipulated.
 """
 
 import math

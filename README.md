@@ -1,3 +1,6 @@
+## Video 
+[Watch the Video here](https://www.youtube.com/watch?v=UCMUNBxPJxY)
+
 ## Overview 
 
 This repository contains the explanation and code necessary for simulating the evolution of [L-system](https://en.wikipedia.org/wiki/L-system) fractals through a parallel hill climbing method as a means of understanding tree growth. A simulation world has been developed for the fractals that attempts to mimic the 
@@ -42,6 +45,14 @@ As with any evolutionary system, a fitness system is required in order to score 
 2. The length of segments can be changed in either direction, about 30% of the original
 3. Noise can be added to both the trunk weights or the branch weights to change the amount slightly to which each pattern is chosen. These are then normalized back to 1 after the changes are made
 
-These mutations affect the genotype of the child, giving it a slightly different fitness that may be better or worse than its parent. Parallel hill climber, as utilized in class, compares the fitness of a parent and child, preserving the individual with higher fitness.
+These mutations affect the genotype of the child, giving it a slightly different fitness that may be better or worse than its parent. Parallel hill climber, as utilized in class, compares the fitness of a parent and child, preserving the individual with higher fitness. The values for these mutations can also be altered within the code.
+
+## Parallel Hill Climbing 
+
+   In the given code, 10 different parallel islands are created, with a variable number of generations as well as seed values, corresponding to the set of weights used by each tree. During a "season" of growth, the tree grows until its resources run out, and then its fitness is determined according to the above formula. It is then slightly mutated, and the fitness of its child is determined. If the fitnesses are equal, the child prevails, otherwise the individual with the higher fitness moves on to the next generation. After the specified number of generations, both the initial tree and final tree can be drawn with turtle. 
+
+   There were a myriad of effects observed through the evolution of the trees, especially as different parameters were altered to simulate changing environmental effects, like cloudy atmospheres or wood strengths to resist torque. Some trees spread out more, some converged, others pruned unnecessary branches. 
+
+   More research needs to be done into the pairing of parameters into certain environments regarding their effects on fitness, and the observed tree designs in simulation in contrast to specific types of trees found in those environments. 
     
 
